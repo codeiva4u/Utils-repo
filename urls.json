@@ -1,7 +1,8 @@
 {
   "hdhub4u": "https://new3.hdhub4u.fo",
   "moviesdrive": "https://new1.moviesdrive.surf",
-  "cinevood": "https://1cinevood.biz",
+  "gofile": "https://gofile.io",
+  "gofile": "https://api.gofile.io",
   "hubdrive": "https://hubdrive.space",
   "gdflix": "https://new13.gdflix.net",
   "hubcloud": "https://hubcloud.foo",
@@ -15,4 +16,5 @@
   "cherry": "https://cherry.upns.online",
   "gdmirror": "https://pro.iqsmartgames.com",
   "techinmind": "https://stream.techinmind.space"
+
 }
