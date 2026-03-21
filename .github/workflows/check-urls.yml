@@ -2,12 +2,14 @@ name: Check Provider URLs
 
 on:
   schedule:
-    - cron: '0 0,12 * * *'  # Run twice daily at midnight and noon UTC
-  workflow_dispatch:      # Allow manual triggering
+    - cron: '0 0,12 * * *'
+  workflow_dispatch:
 
-# Set explicit permissions for the GITHUB_TOKEN
 permissions:
   contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # ✅ अभी से Node 24 use होगा
 
 jobs:
   check-urls:
@@ -15,12 +17,12 @@ jobs:
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5   # ✅ updated
       
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5   # ✅ updated
         with:
-          node-version: '25'
+          node-version: '20'   # ⚠️ stable LTS use करो (25 avoid करो)
       
       - name: Install dependencies
         run: npm install axios
@@ -28,14 +30,12 @@ jobs:
       - name: Run URL checker
         run: node .github/scripts/url-checker.js
         
-      # Better approach using git status
       - name: Commit changes if any
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           git add urls.json
           
-          # Check if there are changes using git status (more reliable)
           if [[ $(git status --porcelain urls.json) ]]; then
             echo "Found changes in urls.json, committing..."
             git commit -m "Update provider URLs [skip ci]"
