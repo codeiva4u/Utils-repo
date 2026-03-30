@@ -2,14 +2,14 @@ name: Check Provider URLs
 
 on:
   schedule:
-    - cron: '0 0,12 * * *'
-  workflow_dispatch:
+    - cron: '0 0,12 * * *'  # हर 12 घंटे में चलेगा (दिन में 2 बार)
+  workflow_dispatch:               # Manual trigger भी available
 
 permissions:
   contents: write
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # ✅ अभी से Node 24 use होगा
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   check-urls:
@@ -17,12 +17,12 @@ jobs:
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5   # ✅ updated
+        uses: actions/checkout@v5
       
       - name: Set up Node.js
-        uses: actions/setup-node@v5   # ✅ updated
+        uses: actions/setup-node@v5
         with:
-          node-version: '20'   # ⚠️ stable LTS use करो (25 avoid करो)
+          node-version: '20'
       
       - name: Install dependencies
         run: npm install axios
