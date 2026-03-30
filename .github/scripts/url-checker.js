@@ -2,9 +2,10 @@ const fs = require('fs');
 const axios = require('axios');
 
 const FILE_PATH = 'urls.json';
+const BASELINE_PATH = 'urls-baseline.json';
 
 // ═══════════════════════════════════════════════════════════════
-// Upstream repos to sync from (actively maintained by others)
+// Upstream repos to sync from
 // ═══════════════════════════════════════════════════════════════
 const UPSTREAM_SOURCES = [
     {
@@ -17,9 +18,7 @@ const UPSTREAM_SOURCES = [
     }
 ];
 
-// ═══════════════════════════════════════════════════════════════
-// Common TLDs used by movie/streaming sites (for domain recovery)
-// ═══════════════════════════════════════════════════════════════
+// Common TLDs for domain recovery (ordered by priority)
 const RECOVERY_TLDS = [
     '.io', '.app', '.dev', '.online', '.space', '.live', '.site',
     '.com', '.net', '.org', '.to', '.cc', '.fo', '.dad', '.foo',
@@ -28,44 +27,33 @@ const RECOVERY_TLDS = [
     '.vodka', '.restaurant', '.top', '.company', '.ltd', '.im',
     '.fit', '.llc', '.cv', '.zip', '.shop', '.fans', '.cloud',
     '.my', '.in', '.co', '.xyz', '.pro', '.me', '.tv', '.is',
-    '.fi', '.it'
+    '.fi', '.it', '.de'
 ];
 
 // ═══════════════════════════════════════════════════════════════
-// Helper functions
+// Helpers
 // ═══════════════════════════════════════════════════════════════
 
-function urlsJson() {
+function readJson(path) {
     try {
-        const data = fs.readFileSync(FILE_PATH, 'utf8');
-        return JSON.parse(data);
-    } catch (error) {
-        console.error(`Error reading ${FILE_PATH}:`, error);
-        process.exit(1);
+        return JSON.parse(fs.readFileSync(path, 'utf8'));
+    } catch {
+        return null;
     }
 }
 
 function getDomain(url) {
-    try {
-        const urlObj = new URL(url);
-        return urlObj.origin;
-    } catch (error) {
-        console.error(`Error parsing URL ${url}:`, error);
-        return url;
-    }
+    try { return new URL(url).origin; }
+    catch { return url; }
 }
 
 function getFullPath(url) {
     try {
-        const urlObj = new URL(url);
-        let result = urlObj.origin;
-        if (urlObj.pathname && urlObj.pathname !== '/') {
-            result += urlObj.pathname;
-        }
-        return result;
-    } catch (error) {
-        return url;
-    }
+        const u = new URL(url);
+        let r = u.origin;
+        if (u.pathname && u.pathname !== '/') r += u.pathname;
+        return r;
+    } catch { return url; }
 }
 
 function hasTrailingSlash(url) {
@@ -73,140 +61,233 @@ function hasTrailingSlash(url) {
 }
 
 function preserveTrailingSlash(newUrl, originalUrl) {
-    const needsSlash = hasTrailingSlash(originalUrl);
-    const hasSlash = hasTrailingSlash(newUrl);
-    if (needsSlash && !hasSlash) return newUrl + '/';
-    if (!needsSlash && hasSlash) return newUrl.slice(0, -1);
+    const needs = hasTrailingSlash(originalUrl);
+    const has = hasTrailingSlash(newUrl);
+    if (needs && !has) return newUrl + '/';
+    if (!needs && has) return newUrl.slice(0, -1);
     return newUrl;
 }
 
-// Get the TLD from a hostname (last part after the last dot)
 function getTld(hostname) {
-    const parts = hostname.split('.');
-    return '.' + parts[parts.length - 1];
+    const p = hostname.split('.');
+    return '.' + p[p.length - 1];
 }
 
-// Get base hostname without TLD
 function getBaseHostname(hostname) {
-    const parts = hostname.split('.');
-    return parts.slice(0, -1).join('.');
+    const p = hostname.split('.');
+    return p.slice(0, -1).join('.');
 }
 
-// Detect ad/tracking/spam redirect URLs
 function isAdOrTrackerUrl(url) {
     try {
-        const urlObj = new URL(url);
-        const host = urlObj.hostname.toLowerCase();
-        const path = urlObj.pathname.toLowerCase();
-
-        const adDomains = [
-            'bonuscaf.com', 'clickhubz.com', 'adshort.co', 'shrinkme.io',
-            'linkvertise.com', 'ouo.io', 'ouo.press', 'bit.ly', 'tinyurl.com',
-            'shorte.st', 'adf.ly', 'za.gl', 'bc.vc', 'exe.io',
-            'gplinks.co', 'shrinkforearn.in', 'techymozo.com',
-            'adrinolinks.in', 'link1s.com', 'earnhub.net'
-        ];
-
-        if (adDomains.some(ad => host === ad || host.endsWith('.' + ad))) {
-            return true;
-        }
-
-        const adPathPatterns = [
-            /^\/go\//i, /^\/redirect\//i, /^\/out\//i,
-            /^\/link\//i, /^\/click\//i, /^\/track\//i, /^\/aff\//i,
-        ];
-
-        if (adPathPatterns.some(p => p.test(path))) {
-            return true;
-        }
-
+        const u = new URL(url);
+        const host = u.hostname.toLowerCase();
+        const path = u.pathname.toLowerCase();
+        const adDomains = ['bonuscaf.com','clickhubz.com','adshort.co','shrinkme.io','linkvertise.com','ouo.io','ouo.press','bit.ly','tinyurl.com','shorte.st','adf.ly','za.gl','bc.vc','exe.io','gplinks.co','shrinkforearn.in','techymozo.com','adrinolinks.in','link1s.com','earnhub.net','hugedomains.com','sedo.com','afternic.com','dan.com','bodis.com','parkingcrew.net','domainmarket.com','undeveloped.com','domainlore.com','namesilo.com'];
+        if (adDomains.some(ad => host === ad || host.endsWith('.' + ad))) return true;
+        if ([/^\/go\//i,/^\/redirect\//i,/^\/out\//i,/^\/link\//i,/^\/click\//i,/^\/track\//i,/^\/aff\//i].some(p => p.test(path))) return true;
         return false;
-    } catch {
-        return false;
+    } catch { return false; }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Network helpers
+// ═══════════════════════════════════════════════════════════════
+
+async function isUrlAlive(url) {
+    for (const method of ['head', 'get']) {
+        try {
+            await axios[method](url, {
+                timeout: 15000, maxRedirects: 5,
+                validateStatus: () => true,
+                headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' }
+            });
+            return true;
+        } catch (e) {
+            if (e.code === 'ENOTFOUND' || e.code === 'ECONNREFUSED') return false;
+        }
     }
+    return false;
+}
+
+async function fetchUpstreamUrls() {
+    const merged = {};
+    for (const source of UPSTREAM_SOURCES) {
+        try {
+            const r = await axios.get(source.url, { timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+            if (r.status === 200 && r.data) {
+                const data = typeof r.data === 'string' ? JSON.parse(r.data) : r.data;
+                for (const [key, url] of Object.entries(data)) {
+                    merged[key.toLowerCase()] = { url, source: source.name };
+                }
+                console.log(`📦 Fetched ${Object.keys(data).length} URLs from ${source.name}`);
+            }
+        } catch (e) {
+            console.log(`⚠️ Failed to fetch from ${source.name}: ${e.message}`);
+        }
+    }
+    return merged;
 }
 
 // ═══════════════════════════════════════════════════════════════
 // LAYER 1: Upstream Sync
 // ═══════════════════════════════════════════════════════════════
 
-async function fetchUpstreamUrls() {
-    const merged = {};
-
-    for (const source of UPSTREAM_SOURCES) {
-        try {
-            const response = await axios.get(source.url, {
-                timeout: 15000,
-                headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' }
-            });
-
-            if (response.status === 200 && response.data) {
-                const data = typeof response.data === 'string'
-                    ? JSON.parse(response.data)
-                    : response.data;
-
-                for (const [key, url] of Object.entries(data)) {
-                    merged[key.toLowerCase()] = { url, source: source.name };
-                }
-                console.log(`📦 Fetched ${Object.keys(data).length} URLs from ${source.name}`);
+async function syncFromUpstream(providers, upstreamUrls, updatedKeys) {
+    let changes = 0;
+    for (const [name, currentUrl] of Object.entries(providers)) {
+        const up = upstreamUrls[name.toLowerCase()];
+        if (!up) continue;
+        if (getDomain(up.url) !== getDomain(currentUrl)) {
+            const alive = await isUrlAlive(up.url);
+            if (alive) {
+                const newUrl = preserveTrailingSlash(getFullPath(up.url), currentUrl);
+                providers[name] = newUrl;
+                updatedKeys.add(name);
+                changes++;
+                console.log(`📥 SYNCED ${name}: ${currentUrl} → ${newUrl} (${up.source})`);
+            } else {
+                console.log(`⚠️ ${name}: upstream ${up.url} also dead`);
             }
-        } catch (error) {
-            console.log(`⚠️ Failed to fetch from ${source.name}: ${error.message}`);
+        } else {
+            console.log(`✅ ${name}: matches upstream`);
         }
     }
-
-    return merged;
+    return changes;
 }
 
-async function isUrlAlive(url) {
-    // Any HTTP response (even 403/503 Cloudflare) = alive
-    // Only ENOTFOUND / ECONNREFUSED = dead
-    const methods = ['head', 'get'];
-    for (const method of methods) {
+// ═══════════════════════════════════════════════════════════════
+// LAYER 2: HTTP Redirect + JS Redirect
+// ═══════════════════════════════════════════════════════════════
+
+function extractJsRedirect(html) {
+    if (!html || typeof html !== 'string') return null;
+    for (const p of [
+        /(?:window|document)\.location(?:\.href)?\s*=\s*["']([^"']+)["']/i,
+        /(?:window|document)\.location\.replace\s*\(\s*["']([^"']+)["']\s*\)/i,
+        /location\.assign\s*\(\s*["']([^"']+)["']\s*\)/i,
+    ]) {
+        const m = html.match(p);
+        if (m && m[1] && m[1].startsWith('http')) return m[1];
+    }
+    const meta = html.match(/<meta\s+http-equiv\s*=\s*["']refresh["']\s+content\s*=\s*["']\d+\s*;\s*url\s*=\s*([^"'\s>]+)["']/i);
+    if (meta && meta[1] && meta[1].startsWith('http')) return meta[1];
+    return null;
+}
+
+async function checkUrl(url) {
+    try {
+        const r = await axios.get(url, {
+            maxRedirects: 10, timeout: 15000,
+            headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36', 'Accept': 'text/html' },
+            validateStatus: s => true,
+        });
+        const finalUrl = r.request?.res?.responseUrl || r.request?._redirectable?._currentUrl || url;
+        if (getDomain(finalUrl) !== getDomain(url)) {
+            if (isAdOrTrackerUrl(finalUrl)) { console.log(`🚫 ${url} → ad/tracker — ignoring`); return { newUrl: null, isDead: false }; }
+            console.log(`🔄 ${url} redirected to ${finalUrl}`);
+            return { newUrl: getFullPath(finalUrl), isDead: false };
+        }
+        if (r.status === 200 && r.data && typeof r.data === 'string') {
+            const js = extractJsRedirect(r.data);
+            if (js && getDomain(js) !== getDomain(url)) {
+                if (isAdOrTrackerUrl(js)) { console.log(`🚫 ${url} JS → ad — ignoring`); }
+                else { console.log(`🔀 ${url} JS redirect → ${js}`); return { newUrl: getFullPath(js), isDead: false }; }
+            }
+        }
+        if (r.status === 200) { console.log(`✅ ${url} valid (200)`); return { newUrl: null, isDead: false }; }
+        if (r.status >= 500) { console.log(`💀 ${url} server error ${r.status}`); return { newUrl: null, isDead: true }; }
+        console.log(`⚠️ ${url} status ${r.status}`);
+        return { newUrl: null, isDead: false };
+    } catch (error) {
         try {
-            await axios[method](url, {
-                timeout: 15000,
-                maxRedirects: 5,
-                validateStatus: () => true,
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
-                }
-            });
-            return true; // Got response = alive
-        } catch (error) {
-            if (error.code === 'ENOTFOUND') return false;
-            if (error.code === 'ECONNREFUSED') return false;
-            // timeout/other = try next method
+            const r = await axios.head(url, { maxRedirects: 10, timeout: 10000, validateStatus: s => true, headers: { 'User-Agent': 'Mozilla/5.0' } });
+            const finalUrl = r.request?.res?.responseUrl || r.request?._redirectable?._currentUrl || url;
+            if (getDomain(finalUrl) !== getDomain(url)) {
+                if (isAdOrTrackerUrl(finalUrl)) return { newUrl: null, isDead: false };
+                console.log(`🔄 ${url} redirected → ${finalUrl}`);
+                return { newUrl: getFullPath(finalUrl), isDead: false };
+            }
+            console.log(`✅ ${url} valid (${r.status} HEAD)`);
+            return { newUrl: null, isDead: false };
+        } catch (e2) {
+            const dead = ['ENOTFOUND','ECONNREFUSED'].includes(error.code) || ['ENOTFOUND','ECONNREFUSED'].includes(e2?.code);
+            if (dead) console.log(`❌ ${url} — DEAD`);
+            else console.log(`❌ ${url} — ${error.code || error.message}`);
+            return { newUrl: null, isDead: dead };
         }
     }
-    return false;
 }
 
-async function syncFromUpstream(providers, upstreamUrls, syncedKeys) {
+// ═══════════════════════════════════════════════════════════════
+// LAYER 3: Smart Domain Recovery (TLD brute-force)
+// ═══════════════════════════════════════════════════════════════
+
+async function recoverDomain(name, deadUrl) {
+    try {
+        const hostname = new URL(deadUrl).hostname;
+        const currentTld = getTld(hostname);
+        const baseHost = getBaseHostname(hostname);
+        if (!baseHost) return null;
+
+        console.log(`  🔧 Trying TLD variations for "${baseHost}" (dead: ${currentTld})`);
+
+        for (const tld of RECOVERY_TLDS) {
+            if (tld === currentTld) continue;
+            const tryUrl = `https://${baseHost}${tld}`;
+            try {
+                await axios.head(tryUrl, { timeout: 4000, maxRedirects: 3, validateStatus: () => true, headers: { 'User-Agent': 'Mozilla/5.0' } });
+                console.log(`  ✅ RECOVERED ${name}: ${tryUrl}`);
+                return tryUrl;
+            } catch (e) {
+                if (e.code !== 'ENOTFOUND' && e.code !== 'ECONNREFUSED') {
+                    try {
+                        await axios.get(tryUrl, { timeout: 4000, maxRedirects: 3, validateStatus: () => true, headers: { 'User-Agent': 'Mozilla/5.0' } });
+                        console.log(`  ✅ RECOVERED ${name}: ${tryUrl}`);
+                        return tryUrl;
+                    } catch {}
+                }
+            }
+        }
+        console.log(`  ❌ Could not recover ${name}`);
+        return null;
+    } catch { return null; }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LAYER 4: Baseline Protection
+// If current URL differs from baseline and baseline is alive → revert
+// This catches "alive but wrong" domains that other layers miss
+// ═══════════════════════════════════════════════════════════════
+
+async function baselineProtection(providers, baseline, updatedKeys) {
+    if (!baseline) return 0;
     let changes = 0;
 
     for (const [name, currentUrl] of Object.entries(providers)) {
-        const nameLC = name.toLowerCase();
-        const upstream = upstreamUrls[nameLC];
+        // Skip if already fixed by layers 1-3
+        if (updatedKeys.has(name)) continue;
 
-        if (!upstream) continue;
+        const baselineUrl = baseline[name];
+        if (!baselineUrl) continue; // New key, no baseline
 
-        const upstreamDomain = getDomain(upstream.url);
-        const currentDomain = getDomain(currentUrl);
+        // If current URL matches baseline, skip
+        if (getDomain(currentUrl) === getDomain(baselineUrl)) continue;
 
-        if (upstreamDomain !== currentDomain) {
-            const alive = await isUrlAlive(upstream.url);
-            if (alive) {
-                const newUrl = preserveTrailingSlash(getFullPath(upstream.url), currentUrl);
-                providers[name] = newUrl;
-                syncedKeys.add(name);
-                changes++;
-                console.log(`📥 SYNCED ${name}: ${currentUrl} → ${newUrl} (from ${upstream.source})`);
-            } else {
-                console.log(`⚠️ ${name}: upstream ${upstream.url} also dead`);
-            }
+        // Current URL differs from baseline — check if baseline is alive
+        console.log(`🔍 ${name}: differs from baseline`);
+        console.log(`   Current:  ${currentUrl}`);
+        console.log(`   Baseline: ${baselineUrl}`);
+
+        const baselineAlive = await isUrlAlive(baselineUrl);
+        if (baselineAlive) {
+            const newUrl = preserveTrailingSlash(baselineUrl, currentUrl);
+            providers[name] = newUrl;
+            updatedKeys.add(name);
+            changes++;
+            console.log(`🛡️ REVERTED ${name}: ${currentUrl} → ${newUrl} (baseline alive)`);
         } else {
-            console.log(`✅ ${name}: matches upstream (${currentDomain})`);
+            console.log(`⚠️ ${name}: baseline also dead, keeping current`);
         }
     }
 
@@ -214,292 +295,96 @@ async function syncFromUpstream(providers, upstreamUrls, syncedKeys) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// LAYER 2: HTTP Redirect Check + JS Redirect Detection
-// ═══════════════════════════════════════════════════════════════
-
-function extractJsRedirect(html) {
-    if (!html || typeof html !== 'string') return null;
-
-    const jsPatterns = [
-        /(?:window|document)\.location(?:\.href)?\s*=\s*["']([^"']+)["']/i,
-        /(?:window|document)\.location\.replace\s*\(\s*["']([^"']+)["']\s*\)/i,
-        /location\.assign\s*\(\s*["']([^"']+)["']\s*\)/i,
-    ];
-
-    for (const pattern of jsPatterns) {
-        const match = html.match(pattern);
-        if (match && match[1] && match[1].startsWith('http')) {
-            return match[1];
-        }
-    }
-
-    const metaPattern = /<meta\s+http-equiv\s*=\s*["']refresh["']\s+content\s*=\s*["']\d+\s*;\s*url\s*=\s*([^"'\s>]+)["']/i;
-    const metaMatch = html.match(metaPattern);
-    if (metaMatch && metaMatch[1] && metaMatch[1].startsWith('http')) {
-        return metaMatch[1];
-    }
-
-    return null;
-}
-
-// Returns: { newUrl, isDead }
-async function checkUrl(url) {
-    // ─── Try 1: GET with follow redirects ───
-    try {
-        const response = await axios.get(url, {
-            maxRedirects: 10,
-            timeout: 15000,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            },
-            validateStatus: status => true,
-        });
-
-        const finalUrl = response.request?.res?.responseUrl || response.request?._redirectable?._currentUrl || url;
-        const finalDomain = getDomain(finalUrl);
-        const originalDomain = getDomain(url);
-
-        if (finalDomain !== originalDomain) {
-            if (isAdOrTrackerUrl(finalUrl)) {
-                console.log(`🚫 ${url} redirected to ad/tracker: ${finalUrl} — ignoring`);
-                return { newUrl: null, isDead: false };
-            }
-            console.log(`🔄 ${url} redirected to ${finalUrl}`);
-            return { newUrl: getFullPath(finalUrl), isDead: false };
-        }
-
-        if (response.status === 200 && response.data && typeof response.data === 'string') {
-            const jsRedirect = extractJsRedirect(response.data);
-            if (jsRedirect) {
-                const jsDomain = getDomain(jsRedirect);
-                if (jsDomain !== originalDomain) {
-                    if (isAdOrTrackerUrl(jsRedirect)) {
-                        console.log(`🚫 ${url} JS redirect to ad/tracker: ${jsRedirect} — ignoring`);
-                    } else {
-                        console.log(`🔀 ${url} has JS redirect to ${jsRedirect}`);
-                        return { newUrl: getFullPath(jsRedirect), isDead: false };
-                    }
-                }
-            }
-        }
-
-        if (response.status === 200) {
-            console.log(`✅ ${url} is valid (200 OK)`);
-            return { newUrl: null, isDead: false };
-        } else if (response.status >= 500) {
-            console.log(`💀 ${url} returned server error ${response.status} — marking for recovery`);
-            return { newUrl: null, isDead: true };
-        } else {
-            console.log(`⚠️ ${url} returned status ${response.status}`);
-        }
-        return { newUrl: null, isDead: false };
-
-    } catch (error) {
-        // ─── Try 2: HEAD ───
-        try {
-            const response = await axios.head(url, {
-                maxRedirects: 10,
-                timeout: 10000,
-                validateStatus: status => true,
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
-                }
-            });
-
-            const finalUrl = response.request?.res?.responseUrl || response.request?._redirectable?._currentUrl || url;
-            const finalDomain = getDomain(finalUrl);
-            const originalDomain = getDomain(url);
-
-            if (finalDomain !== originalDomain) {
-                if (isAdOrTrackerUrl(finalUrl)) {
-                    console.log(`🚫 ${url} redirected to ad/tracker: ${finalUrl} — ignoring`);
-                    return { newUrl: null, isDead: false };
-                }
-                console.log(`🔄 ${url} redirected to ${finalUrl}`);
-                return { newUrl: getFullPath(finalUrl), isDead: false };
-            }
-
-            console.log(`✅ ${url} is valid (${response.status} via HEAD)`);
-            return { newUrl: null, isDead: false };
-
-        } catch (headError) {
-            const isDead = (error.code === 'ENOTFOUND' || headError?.code === 'ENOTFOUND' ||
-                            error.code === 'ECONNREFUSED' || headError?.code === 'ECONNREFUSED');
-
-            if (error.code === 'ENOTFOUND' || headError?.code === 'ENOTFOUND') {
-                console.log(`❌ ${url} — domain not found (DEAD)`);
-            } else if (error.code === 'ECONNABORTED' || headError?.code === 'ECONNABORTED') {
-                console.log(`⌛ ${url} — timed out`);
-            } else if (error.code === 'ECONNREFUSED' || headError?.code === 'ECONNREFUSED') {
-                console.log(`❌ ${url} — connection refused (DEAD)`);
-            } else {
-                console.log(`❌ ${url} — error: ${error.message}`);
-            }
-            return { newUrl: null, isDead };
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// LAYER 3: Smart Domain Recovery
-// When domain is dead, try TLD variations to find the correct one
-// ═══════════════════════════════════════════════════════════════
-
-async function recoverDomain(name, deadUrl) {
-    try {
-        const urlObj = new URL(deadUrl);
-        const hostname = urlObj.hostname;
-
-        const currentTld = getTld(hostname);
-        const baseHost = getBaseHostname(hostname);
-
-        if (!baseHost) return null;
-
-        console.log(`  🔧 Recovery: trying TLD variations for "${baseHost}" (was: ${currentTld})`);
-
-        for (const tld of RECOVERY_TLDS) {
-            if (tld === currentTld) continue; // skip dead TLD
-
-            const tryHostname = baseHost + tld;
-            const tryUrl = `${urlObj.protocol}//${tryHostname}`;
-
-            try {
-                const response = await axios.head(tryUrl, {
-                    timeout: 4000,
-                    maxRedirects: 3,
-                    validateStatus: () => true,
-                    headers: {
-                        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
-                    }
-                });
-
-                // Found a live domain!
-                console.log(`  ✅ RECOVERED ${name}: ${tryUrl} (status: ${response.status})`);
-                return tryUrl;
-            } catch (error) {
-                if (error.code !== 'ENOTFOUND') {
-                    // Got some response (even error) = domain exists
-                    // Try GET to confirm
-                    try {
-                        await axios.get(tryUrl, {
-                            timeout: 4000,
-                            maxRedirects: 3,
-                            validateStatus: () => true,
-                            headers: {
-                                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
-                            }
-                        });
-                        console.log(`  ✅ RECOVERED ${name}: ${tryUrl}`);
-                        return tryUrl;
-                    } catch {
-                        // truly dead, continue
-                    }
-                }
-                // ENOTFOUND = this TLD doesn't exist, try next
-            }
-        }
-
-        console.log(`  ❌ Could not recover ${name} — no TLD variation worked`);
-        return null;
-    } catch (error) {
-        return null;
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════
 // Main
 // ═══════════════════════════════════════════════════════════════
 
 async function main() {
-    const providers = urlsJson();
+    const providers = readJson(FILE_PATH);
+    if (!providers) { console.error('Cannot read ' + FILE_PATH); process.exit(1); }
+
+    const baseline = readJson(BASELINE_PATH); // May be null on first run
     let hasChanges = false;
+    const updatedKeys = new Set(); // Track all keys updated by any layer
 
-    console.log('');
-    console.log('═══════════════════════════════════════════');
+    // ─── LAYER 1 ────────────────────────────────────────────────
+    console.log('\n═══════════════════════════════════════════');
     console.log('   LAYER 1: Upstream Sync');
-    console.log('═══════════════════════════════════════════');
-    console.log('');
+    console.log('═══════════════════════════════════════════\n');
 
-    const upstreamUrls = await fetchUpstreamUrls();
-    const syncedKeys = new Set();
-    const syncCount = await syncFromUpstream(providers, upstreamUrls, syncedKeys);
-    if (syncCount > 0) {
-        hasChanges = true;
-        console.log(`\n📊 Synced ${syncCount} URL(s) from upstream\n`);
-    } else {
-        console.log('\nℹ️ All common URLs already match upstream\n');
-    }
+    const upstream = await fetchUpstreamUrls();
+    const syncCount = await syncFromUpstream(providers, upstream, updatedKeys);
+    if (syncCount > 0) { hasChanges = true; console.log(`\n📊 Synced ${syncCount} URL(s)\n`); }
+    else console.log('\nℹ️ All match upstream\n');
 
+    // ─── LAYER 2 ────────────────────────────────────────────────
     console.log('═══════════════════════════════════════════');
     console.log('   LAYER 2: HTTP Redirect Check');
-    console.log('═══════════════════════════════════════════');
-    console.log('');
+    console.log('═══════════════════════════════════════════\n');
 
-    const deadUrls = []; // Track dead URLs for Layer 3
-
+    const deadUrls = [];
     for (const [name, url] of Object.entries(providers)) {
-        if (syncedKeys.has(name)) {
-            console.log(`⏩ Skipping ${name} — already synced from upstream`);
-            continue;
-        }
-
+        if (updatedKeys.has(name)) { console.log(`⏩ ${name} — synced`); continue; }
         console.log(`Checking ${name} (${url})...`);
-
         try {
-            const result = await checkUrl(url);
-            if (result.newUrl) {
-                const finalUrl = preserveTrailingSlash(result.newUrl, url);
-                if (finalUrl !== url) {
-                    providers[name] = finalUrl;
-                    hasChanges = true;
-                    console.log(`🔄 Updated ${name}: ${url} → ${finalUrl}`);
-                }
-            } else if (result.isDead) {
-                deadUrls.push({ name, url });
-            }
-        } catch (error) {
-            console.log(`❌ Error processing ${name}: ${error.message}`);
-        }
+            const { newUrl, isDead } = await checkUrl(url);
+            if (newUrl) {
+                const final = preserveTrailingSlash(newUrl, url);
+                if (final !== url) { providers[name] = final; updatedKeys.add(name); hasChanges = true; console.log(`🔄 Updated ${name}: → ${final}`); }
+            } else if (isDead) { deadUrls.push({ name, url }); }
+        } catch (e) { console.log(`❌ ${name}: ${e.message}`); }
     }
 
-    // ─── LAYER 3: Recover dead domains ───
+    // ─── LAYER 3: Baseline Protection (for ALL changed URLs) ────
+    console.log('\n═══════════════════════════════════════════');
+    console.log('   LAYER 3: Baseline Protection');
+    console.log('═══════════════════════════════════════════\n');
+
+    if (baseline) {
+        const revertCount = await baselineProtection(providers, baseline, updatedKeys);
+        if (revertCount > 0) { hasChanges = true; console.log(`\n🛡️ Reverted ${revertCount} URL(s) to baseline\n`); }
+        else console.log('ℹ️ All URLs match baseline\n');
+
+        // Remove dead URLs that were fixed by baseline from the dead list
+        const stillDead = deadUrls.filter(d => !updatedKeys.has(d.name));
+        deadUrls.length = 0;
+        deadUrls.push(...stillDead);
+    } else {
+        console.log('ℹ️ No baseline file found, creating initial baseline\n');
+    }
+
+    // ─── LAYER 4: TLD Recovery (ONLY for dead URLs not fixed by baseline)
     if (deadUrls.length > 0) {
-        console.log('');
         console.log('═══════════════════════════════════════════');
-        console.log('   LAYER 3: Smart Domain Recovery');
-        console.log('═══════════════════════════════════════════');
-        console.log('');
-        console.log(`Found ${deadUrls.length} dead URL(s), attempting recovery...`);
-        console.log('');
+        console.log('   LAYER 4: Domain Recovery (TLD brute-force)');
+        console.log('═══════════════════════════════════════════\n');
+        console.log(`${deadUrls.length} dead URL(s) still need recovery...\n`);
 
         for (const { name, url } of deadUrls) {
             const recovered = await recoverDomain(name, url);
             if (recovered) {
-                const finalUrl = preserveTrailingSlash(recovered, url);
-                providers[name] = finalUrl;
-                hasChanges = true;
-                console.log(`🔧 Recovered ${name}: ${url} → ${finalUrl}`);
+                const final = preserveTrailingSlash(recovered, url);
+                providers[name] = final; updatedKeys.add(name); hasChanges = true;
+                console.log(`🔧 ${name}: ${url} → ${final}`);
             }
         }
     }
 
-    // Write changes
-    console.log('');
+    // ─── Save changes ───────────────────────────────────────────
     console.log('═══════════════════════════════════════════');
     console.log('   Results');
     console.log('═══════════════════════════════════════════');
 
     if (hasChanges) {
-        const jsonString = JSON.stringify(providers, null, 2);
-        fs.writeFileSync(FILE_PATH, jsonString + '\n');
-        console.log(`\n✅ Updated ${FILE_PATH} with new URLs`);
+        fs.writeFileSync(FILE_PATH, JSON.stringify(providers, null, 2) + '\n');
+        console.log(`\n✅ Updated ${FILE_PATH}`);
     } else {
-        console.log(`\nℹ️ No changes needed for ${FILE_PATH}`);
+        console.log(`\nℹ️ No changes needed`);
     }
+
+    // Always update baseline with current correct URLs
+    // This ensures new keys and legitimate changes are saved
+    fs.writeFileSync(BASELINE_PATH, JSON.stringify(providers, null, 2) + '\n');
+    console.log(`📋 Baseline updated`);
 }
 
-main().catch(error => {
-    console.error('Unhandled error:', error);
-    process.exit(1);
-});
+main().catch(e => { console.error('FATAL:', e); process.exit(1); });
