@@ -150,25 +150,28 @@ async function fetchUpstreamUrls() {
 }
 
 async function isUrlAlive(url) {
-    // Try HEAD first, then GET as fallback
-    // Note: Some sites return 404 for HEAD but 200 for GET
+    // For upstream sync, we only need to know: does this domain EXIST?
+    // Any HTTP response (even 403/503 Cloudflare) means domain is alive.
+    // Only ENOTFOUND / ECONNREFUSED / timeout = truly dead.
     const methods = ['head', 'get'];
     for (const method of methods) {
         try {
             const response = await axios[method](url, {
-                timeout: 10000,
+                timeout: 15000,
                 maxRedirects: 5,
-                validateStatus: status => true,
+                validateStatus: () => true, // Accept ANY status
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
                 }
             });
-            if (response.status >= 200 && response.status < 400) {
-                return true;
-            }
-            // If HEAD returned non-success, continue to try GET
-        } catch {
-            // If HEAD threw, continue to try GET
+            // Got ANY response = domain is alive (even 403/503 Cloudflare)
+            return true;
+        } catch (error) {
+            // ENOTFOUND = domain doesn't exist (truly dead)
+            if (error.code === 'ENOTFOUND') return false;
+            // ECONNREFUSED = server explicitly refusing (truly dead)
+            if (error.code === 'ECONNREFUSED') return false;
+            // Other errors (timeout, etc.) = try next method
         }
     }
     return false;
