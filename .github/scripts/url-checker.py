@@ -64,6 +64,10 @@ AIOHTTP_TIMEOUT = 12    # seconds — Phase 1 quick check
 DDG_TIMEOUT     = 10    # seconds — Phase 3 DuckDuckGo search
 CONCURRENCY     = 8     # एक साथ max async domains
 
+# CI/GitHub Actions detection — CI में conservative mode चालू करो
+# Data center IP पर CF/anti-bot block होता है, इसलिए conservative रहो
+IS_CI = bool(os.environ.get("GITHUB_ACTIONS") or os.environ.get("CI"))
+
 # Comprehensive TLDs for brute-force discovery (Phase 2.5)
 # Dead domain मिला → same brand, different TLD try करो
 # सभी popular + niche TLDs included ताकि कोई भी domain miss न हो
@@ -102,6 +106,30 @@ COMMON_TLDS = [
     "foundation", "institute", "academy", "university",
     "fans"
 ]
+
+# TLD Priority Scoring — streaming/movie sites इन TLDs पर ज़्यादा होते हैं
+# Higher score = more trustworthy for this domain type
+# "first match wins" के बजाय highest score वाला domain select होगा
+TLD_PRIORITY = {
+    # Tier 1 — streaming/movie sites के common TLDs (score 10)
+    "com": 10, "net": 10, "org": 9, "io": 9,
+    # Tier 2 — niche TLDs used by streaming sites (score 8)
+    "app": 8, "dev": 8, "site": 8, "cloud": 8, "space": 8,
+    "fans": 8, "dad": 8, "foo": 8, "live": 8, "tv": 8,
+    "stream": 8, "watch": 8, "movie": 8, "download": 8,
+    # Tier 3 — decent TLDs (score 6)
+    "online": 6, "xyz": 6, "co": 6, "me": 6, "cc": 6,
+    "pro": 6, "fun": 6, "top": 6, "one": 6, "plus": 6,
+    "sbs": 6, "autos": 6, "mom": 6, "lol": 6,
+    # Tier 4 — country codes (score 4)
+    "in": 4, "de": 4, "uk": 4, "us": 4, "fr": 4,
+    "it": 4, "es": 4, "nl": 4, "ru": 4, "br": 4,
+    "fo": 4, "cv": 4, "re": 4, "ai": 4, "my": 4,
+    # Tier 5 — free/suspicious TLDs (score 2)
+    "tk": 2, "cf": 2, "ga": 2, "gq": 2, "ml": 2,
+}
+# Default score for unlisted TLDs
+TLD_DEFAULT_SCORE = 3
 
 # ══════════════════════════════════════════════════════════
 # Browser-like headers
@@ -176,6 +204,66 @@ def is_parking_redirect(url: str) -> bool:
         return False
 
 
+# ══════════════════════════════════════════════════════════
+# Cloudflare / Anti-bot detection
+# GitHub Actions data center IP → CF/anti-bot block होता है
+# ══════════════════════════════════════════════════════════
+
+def is_cloudflare_challenge(html: str, status: int = 200) -> bool:
+    """
+    Cloudflare challenge/block page detection.
+    GitHub Actions data center IPs को CF अक्सर block करता है।
+    True → CF challenge page → site alive है, बस हमें block कर रहा
+    """
+    if not html:
+        return False
+    html_lower = html.lower()
+    cf_indicators = [
+        "checking your browser",
+        "cloudflare",
+        "cf-browser-verification",
+        "challenge-platform",
+        "ray id",
+        "cf-chl-bypass",
+        "just a moment",
+        "_cf_chl_opt",
+        "turnstile",
+        "cdn-cgi/challenge-platform",
+    ]
+    matches = sum(1 for ind in cf_indicators if ind in html_lower)
+    return matches >= 2
+
+
+def is_antibot_page(html: str, status: int = 200) -> bool:
+    """
+    General anti-bot/WAF detection — Cloudflare + DDoS-Guard + Sucuri etc.
+    True → site alive है, anti-bot block कर रहा → don't replace
+    """
+    if is_cloudflare_challenge(html, status):
+        return True
+    if not html:
+        return False
+    html_lower = html.lower()
+    antibot_indicators = [
+        "ddos-guard",
+        "ddos protection",
+        "blocked by security",
+        "access denied",
+        "security check",
+        "sucuri",
+        "incapsula",
+        "imperva",
+        "bot protection",
+        "human verification",
+        "please verify you are human",
+    ]
+    matches = sum(1 for ind in antibot_indicators if ind in html_lower)
+    # Status 403 with anti-bot keywords = definitely blocked
+    if status == 403 and matches >= 1:
+        return True
+    return matches >= 2
+
+
 # "No content" page patterns — pixeldrain.de जैसे cases
 NO_CONTENT_RE = re.compile(
     r"(?:has\s+no\s+content|no\s+content\s*[-–—]?\s*nada"
@@ -193,10 +281,18 @@ def is_parking_or_dead(html: str, url: str) -> bool:
     IMPORTANT: JS-rendered sites (React, Vue, WordPress SPA) often return
     minimal/empty HTML via HTTP but work perfectly in browser.
     Empty body alone ≠ dead. Only KNOWN dead patterns = dead.
+
+    IMPORTANT: Cloudflare/anti-bot challenge pages ≠ dead!
+    CI/data center IPs को CF block करता है — site alive है।
     """
     # Completely empty response = can't determine, let caller decide
     if not html:
         return False  # Benefit of doubt — could be JS app
+
+    # ── CF/Anti-bot check FIRST — ये dead नहीं है! ───────
+    # GitHub Actions में CF challenge मिलना = site alive है
+    if is_antibot_page(html):
+        return False  # Site alive — anti-bot blocking us
 
     try:
         soup = BeautifulSoup(html, "html.parser")
@@ -581,7 +677,14 @@ async def discover_via_tld_bruteforce(
     tld_sem = asyncio.Semaphore(10)  # Max 10 concurrent
     tld_connector = aiohttp.TCPConnector(ssl=False, limit=20)
 
-    async def try_tld(tld_session: aiohttp.ClientSession, candidate_base: str) -> str | None:
+    async def try_tld(tld_session: aiohttp.ClientSession, candidate_base: str) -> dict | None:
+        """
+        TLD candidate check — scored system.
+        Returns: {"url": str, "score": int, "tld": str} or None
+        
+        "First match wins" नहीं — सब candidates check करो,
+        फिर highest score वाला select करो।
+        """
         test_url = f"{candidate_base}{original_path}"
         async with tld_sem:
             try:
@@ -600,9 +703,25 @@ async def discover_via_tld_bruteforce(
 
                 # 2. Process outside the strict aiohttp timeout block
                 if status == 200 and html:
+                    # Anti-bot check — CF challenge = site exists but blocked
+                    # CI में इसे lower score दो, local में normal
+                    if is_antibot_page(html):
+                        if IS_CI:
+                            # CI में CF block = site probably exists
+                            # लेकिन content verify नहीं कर सकते → low score
+                            tld = urlparse(test_url).hostname.split(".")[-1]
+                            score = TLD_PRIORITY.get(tld, TLD_DEFAULT_SCORE)
+                            print(f"   🛡️  TLD {tld}: CF block (score {score}, unverified)")
+                            return {"url": test_url, "score": score, "tld": tld, "cf_blocked": True}
+                        return None  # Local में CF block = skip
+
                     if strict_verify(html, test_url, name, brand):
-                        print(f"   ✅  TLD verified: {test_url}")
-                        return test_url
+                        tld = urlparse(test_url).hostname.split(".")[-1]
+                        base_score = TLD_PRIORITY.get(tld, TLD_DEFAULT_SCORE)
+                        # Verified content = bonus score (+20)
+                        score = base_score + 20
+                        print(f"   ✅  TLD verified: {test_url} (score {score})")
+                        return {"url": test_url, "score": score, "tld": tld, "cf_blocked": False}
 
                 return None
 
@@ -614,10 +733,39 @@ async def discover_via_tld_bruteforce(
         tasks = [try_tld(tld_session, c) for c in candidates]
         results = await asyncio.gather(*tasks)
 
-    # Return first verified result
-    for result in results:
-        if result:
-            return result
+    # ── Scored result processing ──────────────────────────
+    # सब verified results collect करो, highest score वाला select करो
+    verified_results = [r for r in results if r is not None]
+
+    if not verified_results:
+        print(f"   ❌  TLD brute-force: कोई 100% verified TLD नहीं मिला")
+        return None
+
+    # Content-verified results को prefer करो (cf_blocked=False)
+    content_verified = [r for r in verified_results if not r.get("cf_blocked")]
+    cf_only = [r for r in verified_results if r.get("cf_blocked")]
+
+    if content_verified:
+        # Best verified result by score
+        best = max(content_verified, key=lambda r: r["score"])
+        print(f"   🏆  Best TLD: {best['url']} (score {best['score']}, verified)")
+        return best["url"]
+
+    if cf_only and IS_CI:
+        # CI में सिर्फ CF-blocked results मिले — DON'T auto-replace
+        # CF block = site probably exists but we can't verify content
+        # गलत domain replace करने से बचो
+        print(f"   ⚠️  TLD brute-force: {len(cf_only)} CF-blocked candidates found")
+        print(f"   ⚠️  CI mode: CF-blocked domains को auto-replace नहीं करेंगे (unverified)")
+        if os.environ.get("GITHUB_ACTIONS"):
+            builtins.print(f"::warning title=CF Blocked TLDs::{name}: {len(cf_only)} TLD candidates CF-blocked, skipping auto-replace")
+        return None
+
+    # Local mode — CF-blocked results: pick best score
+    if cf_only:
+        best = max(cf_only, key=lambda r: r["score"])
+        print(f"   🏆  Best TLD (CF-blocked): {best['url']} (score {best['score']})")
+        return best["url"]
 
     print(f"   ❌  TLD brute-force: कोई 100% verified TLD नहीं मिला")
     return None
@@ -777,9 +925,18 @@ async def process_domain(
         return {"name": name, "old_url": url, "new_url": new_url,
                 "emoji": "🔄", "note": f"Redirect → {get_origin(r1['final_url'])}"}
 
-    # 200 OK → parking check + BRAND VERIFICATION
+    # 200 OK → CF check → parking check → BRAND VERIFICATION
     if r1["status"] == 200:
         html = r1["html"]
+
+        # ── CF/Anti-bot check FIRST — site alive है, बस block कर रहा ──
+        if is_antibot_page(html):
+            print(f"   🛡️  Anti-bot/CF challenge detected — site alive, blocked by WAF")
+            print(f"   ✅  Keeping original (anti-bot block ≠ dead)")
+            if IS_CI:
+                builtins.print(f"::warning title=Anti-Bot Block::{name}: {url} — CF/anti-bot challenge (site alive, CI blocked)")
+            return {"name": name, "old_url": url, "new_url": None,
+                    "emoji": "✅", "note": f"Working (anti-bot block, site alive)"}
 
         if is_parking_or_dead(html, url):
             # ── Dead/Parking domain detected (200 OK but no real content) ──
@@ -823,7 +980,16 @@ async def process_domain(
                     "emoji": "✅", "note": f"Working (brand not confirmed but site live)"}
 
     # 4xx/5xx → server responded, domain alive → keep original
+    # CI में 403 + CF = anti-bot block, site alive
     if r1["status"] >= 400:
+        html = r1.get("html", "")
+        if is_antibot_page(html, r1["status"]):
+            print(f"   🛡️  Anti-bot block ({r1['status']}) — site alive, WAF blocking")
+            print(f"   ✅  Keeping original (anti-bot block ≠ dead)")
+            if IS_CI:
+                builtins.print(f"::warning title=Anti-Bot Block::{name}: {url} — {r1['status']} anti-bot (site alive)")
+            return {"name": name, "old_url": url, "new_url": None,
+                    "emoji": "✅", "note": f"Working (anti-bot {r1['status']}, site alive)"}
         print(f"   ✅  Server responded ({r1['status']}) — domain alive, keeping original")
         return {"name": name, "old_url": url, "new_url": None,
                 "emoji": "✅", "note": f"Server responded ({r1['status']}) — domain alive"}

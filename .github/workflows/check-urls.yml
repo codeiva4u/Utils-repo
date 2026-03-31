@@ -6,7 +6,6 @@ on:
   push:
     branches: [main]
     paths:
-      - 'urls.json'
       - '.github/scripts/url-checker.py'
       - '.github/workflows/check-urls.yml'
   workflow_dispatch:         # Manual trigger
