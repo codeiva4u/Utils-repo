@@ -656,21 +656,42 @@ async def discover_via_tld_bruteforce(
         test_url = f"{candidate_base}{original_path}"
         async with tld_sem:
             try:
+                # 1. Fetch with strict timeout
+                status = 0
+                is_cf = False
+                html = ""
                 async with tld_session.request(
                     "GET", test_url,
                     timeout=timeout,
                     allow_redirects=True,
                     headers=HEADERS, ssl=False,
                 ) as r:
-                    if r.status != 200:
-                        return None
-                    html = await r.text(errors="ignore")
+                    status = r.status
+                    if status in (403, 503, 429):
+                        headers_lower = {k.lower(): v.lower() for k, v in r.headers.items()}
+                        server = headers_lower.get("server", "")
+                        if "cloudflare" in server or "cf-ray" in headers_lower:
+                            is_cf = True
+                    elif status == 200:
+                        html = await r.text(errors="ignore")
 
-                    # 100% strict verification
+                # 2. Process outside the strict aiohttp timeout block
+                if status == 200 and html:
                     if strict_verify(html, test_url, name, brand):
                         print(f"   ✅  TLD verified: {test_url}")
                         return test_url
-                    return None
+                
+                elif is_cf:
+                    # CF fallback (takes time, don't bound by aiohttp timeout)
+                    loop = asyncio.get_event_loop()
+                    fr = await loop.run_in_executor(executor, cloudscraper_check_sync, test_url)
+                    if fr["status"] == 200:
+                        fhtml = fr.get("html", "")
+                        if strict_verify(fhtml, test_url, name, brand):
+                            print(f"   ✅  TLD verified (CF bypass): {test_url}")
+                            return test_url
+
+                return None
 
             except Exception:
                 return None
