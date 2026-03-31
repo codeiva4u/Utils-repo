@@ -683,7 +683,7 @@ async def discover_via_tld_bruteforce(
                 
                 elif is_cf:
                     # CF fallback (takes time, don't bound by aiohttp timeout)
-                    loop = asyncio.get_event_loop()
+                    loop = asyncio.get_running_loop()
                     fr = await loop.run_in_executor(executor, cloudscraper_check_sync, test_url)
                     if fr["status"] == 200:
                         fhtml = fr.get("html", "")
@@ -731,7 +731,7 @@ async def discover_new_domain(
 
     original_path = get_path(original_url)
     original_origin = get_origin(original_url)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     # DuckDuckGo HTML — bot-friendly endpoint, no JS needed
     # Search by JSON Key (name) instead of URL brand to get better results
@@ -857,7 +857,7 @@ async def process_domain(
                         "emoji": "🔄", "note": f"Expired (parking redirect) → DDG → {get_origin(new_url)}"}
             print(f"   ❌  Expired domain — no replacement found")
             if os.environ.get("GITHUB_ACTIONS"):
-                print(f"::error title=Expired Domain::{name}: {url} → parking redirect, no replacement")
+                builtins.print(f"::error title=Expired Domain::{name}: {url} → parking redirect, no replacement")
             return {"name": name, "old_url": url, "new_url": None,
                     "emoji": "❌", "note": f"Expired domain (→ parking site)"}
 
@@ -890,7 +890,7 @@ async def process_domain(
             # सब fail → flag as dead
             print(f"   ❌  Dead domain — no replacement found")
             if os.environ.get("GITHUB_ACTIONS"):
-                print(f"::error title=Dead Domain::{name}: {url} — parking/dead page, no replacement found")
+                builtins.print(f"::error title=Dead Domain::{name}: {url} — parking/dead page, no replacement found")
             return {"name": name, "old_url": url, "new_url": None,
                     "emoji": "❌", "note": f"Dead domain (parking/empty page)"}
 
@@ -907,7 +907,7 @@ async def process_domain(
             print(f"   ⚠️  200 OK, content real, brand '{brand}' not confirmed")
             print(f"   ✅  Working (content real, brand not confirmed)")
             if os.environ.get("GITHUB_ACTIONS"):
-                print(f"::warning title=Brand Not Found::{name}: {url} — brand '{brand}' not in page (but site is live)")
+                builtins.print(f"::warning title=Brand Not Found::{name}: {url} — brand '{brand}' not in page (but site is live)")
             return {"name": name, "old_url": url, "new_url": None,
                     "emoji": "✅", "note": f"Working (brand not confirmed but site live)"}
 
@@ -921,7 +921,7 @@ async def process_domain(
 
     # ── Phase 2: cloudscraper CF bypass ───────────────────
     print(f"   🔓  Phase 2: cloudscraper bypass...")
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     r2 = await loop.run_in_executor(executor, cloudscraper_check_sync, url)
 
     # Redirect in Phase 2
@@ -977,7 +977,7 @@ async def process_domain(
     error_note = r1["error"] or f"Status {r1['status']}"
     print(f"   ❌  Dead/unreachable — keeping original ({error_note})")
     if os.environ.get("GITHUB_ACTIONS"):
-        print(f"::error title=Dead Domain::{name}: {url} — {error_note}")
+        builtins.print(f"::error title=Dead Domain::{name}: {url} — {error_note}")
     return {"name": name, "old_url": url, "new_url": None,
             "emoji": "❌", "note": f"Dead — {error_note}"}
 
