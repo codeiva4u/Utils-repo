@@ -30,7 +30,7 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install --upgrade pip aiohttp cloudscraper beautifulsoup4
+        run: pip install --upgrade pip -r requirements.txt
 
       - name: Run Smart URL Checker
         run: python .github/scripts/url-checker.py
