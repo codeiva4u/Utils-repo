@@ -34,6 +34,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -353,6 +354,53 @@ def resolve_redirect(location: str, base_url: str) -> str:
     if location.startswith("http"):
         return location
     return urljoin(base_url, location)
+
+
+def dns_resolve_check(hostname: str) -> bool:
+    """
+    DNS resolution check — domain resolve होता है या नहीं?
+    True  → domain exists (has A/AAAA records)
+    False → NXDOMAIN / no records / error
+
+    GitHub Actions पर Cloudflare 403 देता है, HTTP से verify नहीं हो पाता।
+    DNS check से confirm होता है कि domain real है (सिर्फ GA IP blocked है).
+    """
+    try:
+        results = socket.getaddrinfo(hostname, 443, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        # At least one valid IP
+        return len(results) > 0
+    except (socket.gaierror, socket.herror, OSError):
+        return False
+
+
+def is_cf_challenge_page(html: str) -> bool:
+    """
+    क्या यह page Cloudflare challenge/interstitial page है?
+    True  → CF challenge (not real content)
+    False → real page content
+
+    CF challenge pages: "Just a moment...", "Checking your browser",
+    "ray ID", "cf-challenge", "Attention Required"
+    """
+    if not html:
+        return False
+    html_lower = html[:5000].lower()  # Only check first 5KB
+    cf_indicators = [
+        "just a moment",
+        "checking your browser",
+        "cf-challenge",
+        "cf_chl_opt",
+        "challenge-platform",
+        "attention required",
+        "enable javascript and cookies to continue",
+        "cf-please-wait",
+        "cloudflare ray id",
+        "performance & security by cloudflare",
+        "_cf_chl",
+    ]
+    matches = sum(1 for ind in cf_indicators if ind in html_lower)
+    return matches >= 2  # At least 2 indicators = CF challenge
+
 
 def has_cf_headers(headers: dict) -> bool:
     h = {k.lower() for k in headers}
@@ -677,19 +725,29 @@ async def discover_via_tld_bruteforce(
 
                 # 2. Process outside the strict aiohttp timeout block
                 if status == 200 and html:
-                    if strict_verify(html, test_url, name, brand):
+                    # Check if it's a CF challenge page (not real content)
+                    if is_cf_challenge_page(html):
+                        is_cf = True
+                    elif strict_verify(html, test_url, name, brand):
                         print(f"   ✅  TLD verified: {test_url}")
                         return test_url
-                
-                elif is_cf:
-                    # CF fallback (takes time, don't bound by aiohttp timeout)
+
+                if is_cf:
+                    # CF fallback — try cloudscraper first
                     loop = asyncio.get_running_loop()
                     fr = await loop.run_in_executor(executor, cloudscraper_check_sync, test_url)
                     if fr["status"] == 200:
                         fhtml = fr.get("html", "")
-                        if strict_verify(fhtml, test_url, name, brand):
+                        if not is_cf_challenge_page(fhtml) and strict_verify(fhtml, test_url, name, brand):
                             print(f"   ✅  TLD verified (CF bypass): {test_url}")
                             return test_url
+
+                    # cloudscraper भी fail → DNS fallback (GA datacenter IP blocked)
+                    # Domain DNS resolve होता है = domain exists, CF बस block कर रहा है
+                    candidate_host = urlparse(test_url).hostname or ""
+                    if candidate_host and dns_resolve_check(candidate_host):
+                        print(f"   🌐  TLD DNS-verified (CF-blocked): {test_url}")
+                        return test_url
 
                 return None
 
@@ -866,11 +924,18 @@ async def process_domain(
         return {"name": name, "old_url": url, "new_url": new_url,
                 "emoji": "🔄", "note": f"Redirect → {get_origin(r1['final_url'])}"}
 
-    # 200 OK → parking check + BRAND VERIFICATION
+    # 200 OK → parking check + CF challenge check + BRAND VERIFICATION
     if r1["status"] == 200:
         html = r1["html"]
 
-        if is_parking_or_dead(html, url):
+        # ── CF challenge page detection ──
+        # 200 OK but HTML is actually a CF challenge interstitial (not real content)
+        # Treat same as 403/503 CF → escalate to Phase 2
+        if is_cf_challenge_page(html):
+            print(f"   🛡️  CF challenge page detected (200 OK but CF interstitial)")
+            # Fall through to Phase 2 below (don't return here)
+
+        elif is_parking_or_dead(html, url):
             # ── Dead/Parking domain detected (200 OK but no real content) ──
             # Go directly to TLD brute-force → DDG discovery
             print(f"   ⚠️  Parking/dead page detected (200 OK but empty content)")
