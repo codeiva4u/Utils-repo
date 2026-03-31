@@ -1,31 +1,25 @@
 """
-Smart URL Checker v4 — Anti-bot Bypass + TLD Brute-Force + Dead Domain Discovery
+Smart URL Checker v4 — TLD Brute-Force + Dead Domain Discovery
 ================================================================================
 Logic (3-Phase):
 
 Phase 1 — Quick aiohttp check:
   200 OK + real content  → ✅ Working, no change
   3xx → different domain → 🔄 Update to new domain
-  403/503 + CF headers   → 🛡️ CF-protected, probably OK → Phase 2 verify
-  403/503 no CF headers  → ❓ Suspicious → Phase 2 verify
-  Timeout / DNS fail     → ❌ Dead/wrong → Phase 2 verify
+  4xx/5xx (server alive) → ✅ Keep original (server responded)
+  Timeout / DNS fail     → ❌ Dead/wrong → Phase 2 TLD brute-force
 
-Phase 2 — cloudscraper (Cloudflare JS bypass):
-  200 + real content     → ✅ Working (CF solved)
-  3xx → different domain → 🔄 Update
-  Still failing          → ❌ Dead → Phase 3 discover
+Phase 2 — TLD Brute-Force:
+  Same brand, different TLD try → verify with aiohttp
 
 Phase 3 — DuckDuckGo Discovery:
   DuckDuckGo HTML search → find brand's current domain
   Verify the found URL   → if real content → 🔄 Update
 
 Features:
-  ✅ cloudscraper — Cloudflare JS challenge bypass
   ✅ Parking page detection (GoDaddy, HugeDomains, "domain for sale")
   ✅ DuckDuckGo search for dead domain discovery
-  ✅ Concurrent async checking (aiohttp Phase 1)
-  ✅ Thread executor for sync cloudscraper in async context
-  ✅ Backup before update (urls.backup.json)
+  ✅ Concurrent async checking (aiohttp)
   ✅ GitHub Actions: Job Summary + Dead domain annotations
 """
 
@@ -33,11 +27,8 @@ import asyncio
 import json
 import os
 import re
-import shutil
-import socket
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -352,56 +343,6 @@ def resolve_redirect(location: str, base_url: str) -> str:
     return urljoin(base_url, location)
 
 
-def dns_resolve_check(hostname: str) -> bool:
-    """
-    DNS resolution check — domain resolve होता है या नहीं?
-    True  → domain exists (has A/AAAA records)
-    False → NXDOMAIN / no records / error
-
-    GitHub Actions पर Cloudflare 403 देता है, HTTP से verify नहीं हो पाता।
-    DNS check से confirm होता है कि domain real है (सिर्फ GA IP blocked है).
-    """
-    try:
-        results = socket.getaddrinfo(hostname, 443, socket.AF_UNSPEC, socket.SOCK_STREAM)
-        # At least one valid IP
-        return len(results) > 0
-    except (socket.gaierror, socket.herror, OSError):
-        return False
-
-
-def is_cf_challenge_page(html: str) -> bool:
-    """
-    क्या यह page Cloudflare challenge/interstitial page है?
-    True  → CF challenge (not real content)
-    False → real page content
-
-    CF challenge pages: "Just a moment...", "Checking your browser",
-    "ray ID", "cf-challenge", "Attention Required"
-    """
-    if not html:
-        return False
-    html_lower = html[:5000].lower()  # Only check first 5KB
-    cf_indicators = [
-        "just a moment",
-        "checking your browser",
-        "cf-challenge",
-        "cf_chl_opt",
-        "challenge-platform",
-        "attention required",
-        "enable javascript and cookies to continue",
-        "cf-please-wait",
-        "cloudflare ray id",
-        "performance & security by cloudflare",
-        "_cf_chl",
-    ]
-    matches = sum(1 for ind in cf_indicators if ind in html_lower)
-    return matches >= 2  # At least 2 indicators = CF challenge
-
-
-def has_cf_headers(headers: dict) -> bool:
-    h = {k.lower() for k in headers}
-    return bool(h & {"cf-ray", "cf-cache-status", "x-cache", "via"})
-
 # ══════════════════════════════════════════════════════════
 # Phase 1: aiohttp quick check — async
 # ══════════════════════════════════════════════════════════
@@ -409,7 +350,7 @@ def has_cf_headers(headers: dict) -> bool:
 async def aiohttp_check(session: aiohttp.ClientSession, url: str) -> dict:
     """
     Fast async HTTP check।
-    Returns: {status, final_url, html, domain_changed, cf_protected, error}
+    Returns: {status, final_url, html, domain_changed, error}
     """
     current = url
     visited: set[str] = set()
@@ -449,15 +390,15 @@ async def aiohttp_check(session: aiohttp.ClientSession, url: str) -> dict:
 
         except aiohttp.ClientConnectorError as e:
             return {"status": 0, "final_url": current, "html": "",
-                    "domain_changed": False, "cf_protected": False,
+                    "domain_changed": False,
                     "error": f"DNS/Connection: {e}"}
         except asyncio.TimeoutError:
             return {"status": 0, "final_url": current, "html": "",
-                    "domain_changed": False, "cf_protected": False,
+                    "domain_changed": False,
                     "error": "Timeout"}
         except Exception as e:
             return {"status": 0, "final_url": current, "html": "",
-                    "domain_changed": False, "cf_protected": False,
+                    "domain_changed": False,
                     "error": str(e)}
 
         # Redirect follow करो
@@ -489,13 +430,12 @@ async def aiohttp_check(session: aiohttp.ClientSession, url: str) -> dict:
             "final_url": current,
             "html": last_html,
             "domain_changed": domain_changed,
-            "cf_protected": has_cf_headers(last_headers),
             "error": None,
         }
 
     domain_changed = get_origin(current) != original_origin
     return {"status": 0, "final_url": current, "html": "",
-            "domain_changed": domain_changed, "cf_protected": False,
+            "domain_changed": domain_changed,
             "error": "Max redirects"}
 
 
@@ -647,7 +587,6 @@ async def discover_via_tld_bruteforce(
             try:
                 # 1. Fetch with strict timeout
                 status = 0
-                is_cf = False
                 html = ""
                 async with tld_session.request(
                     "GET", test_url,
@@ -656,29 +595,13 @@ async def discover_via_tld_bruteforce(
                     headers=HEADERS, ssl=False,
                 ) as r:
                     status = r.status
-                    if status in (403, 503, 429):
-                        headers_lower = {k.lower(): v.lower() for k, v in r.headers.items()}
-                        server = headers_lower.get("server", "")
-                        if "cloudflare" in server or "cf-ray" in headers_lower:
-                            is_cf = True
-                    elif status == 200:
+                    if status == 200:
                         html = await r.text(errors="ignore")
 
                 # 2. Process outside the strict aiohttp timeout block
                 if status == 200 and html:
-                    # Check if it's a CF challenge page (not real content)
-                    if is_cf_challenge_page(html):
-                        is_cf = True
-                    elif strict_verify(html, test_url, name, brand):
+                    if strict_verify(html, test_url, name, brand):
                         print(f"   ✅  TLD verified: {test_url}")
-                        return test_url
-
-                if is_cf:
-                    # GA datacenter IP blocked → DNS fallback
-                    # Domain DNS resolve होता है = domain exists, CF बस block कर रहा है
-                    candidate_host = urlparse(test_url).hostname or ""
-                    if candidate_host and dns_resolve_check(candidate_host):
-                        print(f"   🌐  TLD DNS-verified (CF-blocked): {test_url}")
                         return test_url
 
                 return None
@@ -789,13 +712,6 @@ async def discover_new_domain(
                     and brand_matches_content(fhtml, brand)):
                 print(f"   ✅ Found (DDG + redirect): {final}")
                 return final
-            
-            # If redirected to CF-protected site, trust it
-            if fr["status"] in (403, 503, 429) and fr["cf_protected"]:
-                final_host = urlparse(final).hostname or ""
-                if dns_resolve_check(final_host):
-                    print(f"   ✅ Found (DDG + redirect + CF blocked): {final}")
-                    return final
             continue
 
         # Direct 200 + real content + brand confirmed
@@ -804,13 +720,6 @@ async def discover_new_domain(
                 and brand_matches_content(result_html, brand)):
             print(f"   ✅ Found (DDG): {test_url}")
             return test_url
-            
-        # Direct CF-protected
-        if result["status"] in (403, 503, 429) and result["cf_protected"]:
-            test_host = urlparse(test_url).hostname or ""
-            if dns_resolve_check(test_host):
-                print(f"   ✅ Found (DDG + CF blocked): {test_url}")
-                return test_url
 
     print(f"   ❌ कोई valid candidate नहीं मिला")
     return None
@@ -868,18 +777,11 @@ async def process_domain(
         return {"name": name, "old_url": url, "new_url": new_url,
                 "emoji": "🔄", "note": f"Redirect → {get_origin(r1['final_url'])}"}
 
-    # 200 OK → parking check + CF challenge check + BRAND VERIFICATION
+    # 200 OK → parking check + BRAND VERIFICATION
     if r1["status"] == 200:
         html = r1["html"]
 
-        # ── CF challenge page detection ──
-        # 200 OK but HTML is actually a CF challenge interstitial (not real content)
-        # Treat same as 403/503 CF → escalate to Phase 2
-        if is_cf_challenge_page(html):
-            print(f"   🛡️  CF challenge page detected (200 OK but CF interstitial)")
-            # Fall through to Phase 2 below (don't return here)
-
-        elif is_parking_or_dead(html, url):
+        if is_parking_or_dead(html, url):
             # ── Dead/Parking domain detected (200 OK but no real content) ──
             # Go directly to TLD brute-force → DDG discovery
             print(f"   ⚠️  Parking/dead page detected (200 OK but empty content)")
@@ -920,15 +822,15 @@ async def process_domain(
             return {"name": name, "old_url": url, "new_url": None,
                     "emoji": "✅", "note": f"Working (brand not confirmed but site live)"}
 
-    # CF-protected (403/503 with CF headers)
-    if r1["status"] in (403, 503, 429) and r1["cf_protected"]:
-        print(f"   ✅  Working (CF-protected, assumed live)")
+    # 4xx/5xx → server responded, domain alive → keep original
+    if r1["status"] >= 400:
+        print(f"   ✅  Server responded ({r1['status']}) — domain alive, keeping original")
         return {"name": name, "old_url": url, "new_url": None,
-                "emoji": "✅", "note": f"Working (CF blocked {r1['status']} - assumed live)"}
+                "emoji": "✅", "note": f"Server responded ({r1['status']}) — domain alive"}
 
-    # Timeout / DNS fail / 4xx without CF
-    if r1["status"] == 0 or r1["status"] >= 400:
-        print(f"   ❓  Phase 1 inconclusive (status {r1['status']}) → Phase 2")
+    # Status 0 = DNS fail / timeout / connection error → truly dead
+    if r1["status"] == 0:
+        print(f"   ❓  Phase 1 failed ({r1['error']}) → TLD brute-force")
 
     # ── Phase 2: TLD Brute-Force (general failure path) ──
     print(f"   🔀  Phase 2: TLD brute-force...")
