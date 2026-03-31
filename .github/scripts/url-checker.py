@@ -43,13 +43,10 @@ from urllib.parse import urljoin, urlparse
 
 try:
     import aiohttp  # type: ignore
-    import cloudscraper  # type: ignore
-    from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning  # type: ignore
-    import warnings
-    warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
+    from bs4 import BeautifulSoup  # type: ignore
 except ImportError as e:
     print(f"❌ Missing dependency: {e}")
-    print("   Run: pip install aiohttp cloudscraper beautifulsoup4")
+    print("   Run: pip install aiohttp beautifulsoup4")
     sys.exit(1)
 
 import builtins
@@ -73,7 +70,6 @@ print = _custom_print
 FILE_PATH    = Path("urls.json")
 MAX_REDIRECTS  = 10
 AIOHTTP_TIMEOUT = 12    # seconds — Phase 1 quick check
-CS_TIMEOUT      = 20    # seconds — Phase 2 cloudscraper (slower, solving CF)
 DDG_TIMEOUT     = 10    # seconds — Phase 3 DuckDuckGo search
 CONCURRENCY     = 8     # एक साथ max async domains
 
@@ -504,66 +500,11 @@ async def aiohttp_check(session: aiohttp.ClientSession, url: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════
-# Phase 2: cloudscraper — CF bypass (sync, runs in executor)
-# ══════════════════════════════════════════════════════════
-
-def cloudscraper_check_sync(url: str) -> dict:
-    """
-    cloudscraper से CF challenge solve करके page fetch करो।
-    Sync function — asyncio executor में run होगा।
-    """
-    try:
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False},
-            delay=3,
-        )
-        # Manual redirect following
-        current = url
-        original_origin = get_origin(url)
-
-        for _ in range(MAX_REDIRECTS):
-            try:
-                resp = scraper.get(
-                    current,
-                    timeout=CS_TIMEOUT,
-                    allow_redirects=False,
-                    headers={"Referer": current},
-                )
-            except Exception as e:
-                return {"status": 0, "final_url": current, "html": "",
-                        "domain_changed": False, "error": str(e)}
-
-            if 300 <= resp.status_code < 400:
-                location = resp.headers.get("location", "")
-                if location:
-                    current = resolve_redirect(location, current)
-                    continue
-                break
-
-            domain_changed = get_origin(current) != original_origin
-            return {
-                "status": resp.status_code,
-                "final_url": current,
-                "html": resp.text if resp.status_code == 200 else "",
-                "domain_changed": domain_changed,
-                "error": None,
-            }
-
-        return {"status": 0, "final_url": current, "html": "",
-                "domain_changed": False, "error": "Max redirects"}
-
-    except Exception as e:
-        return {"status": 0, "final_url": url, "html": "",
-                "domain_changed": False, "error": str(e)}
-
-
-# ══════════════════════════════════════════════════════════
-# Phase 2.5: TLD Brute-Force — dead domain का सही TLD ढूँढो
+# Phase 2: TLD Brute-Force — dead domain का सही TLD ढूँढो
 # ══════════════════════════════════════════════════════════
 
 async def discover_via_tld_bruteforce(
     session: aiohttp.ClientSession,
-    executor: ThreadPoolExecutor,
     name: str,
     brand: str,
     original_url: str,
@@ -733,16 +674,7 @@ async def discover_via_tld_bruteforce(
                         return test_url
 
                 if is_cf:
-                    # CF fallback — try cloudscraper first
-                    loop = asyncio.get_running_loop()
-                    fr = await loop.run_in_executor(executor, cloudscraper_check_sync, test_url)
-                    if fr["status"] == 200:
-                        fhtml = fr.get("html", "")
-                        if not is_cf_challenge_page(fhtml) and strict_verify(fhtml, test_url, name, brand):
-                            print(f"   ✅  TLD verified (CF bypass): {test_url}")
-                            return test_url
-
-                    # cloudscraper भी fail → DNS fallback (GA datacenter IP blocked)
+                    # GA datacenter IP blocked → DNS fallback
                     # Domain DNS resolve होता है = domain exists, CF बस block कर रहा है
                     candidate_host = urlparse(test_url).hostname or ""
                     if candidate_host and dns_resolve_check(candidate_host):
@@ -774,7 +706,6 @@ async def discover_via_tld_bruteforce(
 
 async def discover_new_domain(
     session: aiohttp.ClientSession,
-    executor: ThreadPoolExecutor,
     name: str,
     brand: str,
     original_url: str,
@@ -844,20 +775,27 @@ async def discover_new_domain(
         test_url = f"{candidate_origin}{original_path}"
         print(f"   🔗 Verifying: {test_url}")
 
-        result = await loop.run_in_executor(executor, cloudscraper_check_sync, test_url)
+        result = await aiohttp_check(session, test_url)
         result_html = result.get("html", "")
         result_final = result.get("final_url", test_url)
 
         # Redirect → final check करो
         if result["domain_changed"] and result["status"] in (301, 302, 307, 308):
             final = f"{get_origin(result_final)}{original_path}"
-            fr = await loop.run_in_executor(executor, cloudscraper_check_sync, final)
+            fr = await aiohttp_check(session, final)
             fhtml = fr.get("html", "")
             if (fr["status"] == 200
                     and not is_parking_or_dead(fhtml, final)
                     and brand_matches_content(fhtml, brand)):
                 print(f"   ✅ Found (DDG + redirect): {final}")
                 return final
+            
+            # If redirected to CF-protected site, trust it
+            if fr["status"] in (403, 503, 429) and fr["cf_protected"]:
+                final_host = urlparse(final).hostname or ""
+                if dns_resolve_check(final_host):
+                    print(f"   ✅ Found (DDG + redirect + CF blocked): {final}")
+                    return final
             continue
 
         # Direct 200 + real content + brand confirmed
@@ -866,6 +804,13 @@ async def discover_new_domain(
                 and brand_matches_content(result_html, brand)):
             print(f"   ✅ Found (DDG): {test_url}")
             return test_url
+            
+        # Direct CF-protected
+        if result["status"] in (403, 503, 429) and result["cf_protected"]:
+            test_host = urlparse(test_url).hostname or ""
+            if dns_resolve_check(test_host):
+                print(f"   ✅ Found (DDG + CF blocked): {test_url}")
+                return test_url
 
     print(f"   ❌ कोई valid candidate नहीं मिला")
     return None
@@ -879,7 +824,6 @@ DomainResult = dict
 
 async def process_domain(
     session: aiohttp.ClientSession,
-    executor: ThreadPoolExecutor,
     name: str,
     url: str,
 ) -> DomainResult:
@@ -901,14 +845,14 @@ async def process_domain(
         if is_parking_redirect(r1["final_url"]):
             print(f"   ⚠️  Redirect → parking site ({get_origin(r1['final_url'])}) — expired domain!")
             # Treat as dead → TLD brute-force → DDG
-            print(f"   🔀  Phase 2.5: TLD brute-force...")
-            new_url = await discover_via_tld_bruteforce(session, executor, name, brand, url)
+            print(f"   🔀  Phase 2: TLD brute-force...")
+            new_url = await discover_via_tld_bruteforce(session, name, brand, url)
             if new_url and new_url != url:
                 print(f"   🔄  TLD brute-force found: {new_url}")
                 return {"name": name, "old_url": url, "new_url": new_url,
                         "emoji": "🔄", "note": f"Expired (parking redirect) → TLD → {get_origin(new_url)}"}
             print(f"   🔍  Phase 3: DDG Discovery...")
-            new_url = await discover_new_domain(session, executor, name, brand, url)
+            new_url = await discover_new_domain(session, name, brand, url)
             if new_url and new_url != url:
                 print(f"   🔄  DDG found: {new_url}")
                 return {"name": name, "old_url": url, "new_url": new_url,
@@ -939,15 +883,15 @@ async def process_domain(
             # ── Dead/Parking domain detected (200 OK but no real content) ──
             # Go directly to TLD brute-force → DDG discovery
             print(f"   ⚠️  Parking/dead page detected (200 OK but empty content)")
-            print(f"   🔀  Phase 2.5: TLD brute-force...")
-            new_url = await discover_via_tld_bruteforce(session, executor, name, brand, url)
+            print(f"   🔀  Phase 2: TLD brute-force...")
+            new_url = await discover_via_tld_bruteforce(session, name, brand, url)
             if new_url and new_url != url:
                 print(f"   🔄  TLD brute-force found: {new_url}")
                 return {"name": name, "old_url": url, "new_url": new_url,
                         "emoji": "🔄", "note": f"Dead domain → TLD brute-force → {get_origin(new_url)}"}
             # TLD brute-force fail → DDG discovery
             print(f"   🔍  Phase 3: DDG Discovery...")
-            new_url = await discover_new_domain(session, executor, name, brand, url)
+            new_url = await discover_new_domain(session, name, brand, url)
             if new_url and new_url != url:
                 print(f"   🔄  DDG discovery found: {new_url}")
                 return {"name": name, "old_url": url, "new_url": new_url,
@@ -978,51 +922,17 @@ async def process_domain(
 
     # CF-protected (403/503 with CF headers)
     if r1["status"] in (403, 503, 429) and r1["cf_protected"]:
-        print(f"   🛡️  CF-protected ({r1['status']}) → Phase 2 bypass")
+        print(f"   ✅  Working (CF-protected, assumed live)")
+        return {"name": name, "old_url": url, "new_url": None,
+                "emoji": "✅", "note": f"Working (CF blocked {r1['status']} - assumed live)"}
 
     # Timeout / DNS fail / 4xx without CF
     if r1["status"] == 0 or r1["status"] >= 400:
         print(f"   ❓  Phase 1 inconclusive (status {r1['status']}) → Phase 2")
 
-    # ── Phase 2: cloudscraper CF bypass ───────────────────
-    print(f"   🔓  Phase 2: cloudscraper bypass...")
-    loop = asyncio.get_running_loop()
-    r2 = await loop.run_in_executor(executor, cloudscraper_check_sync, url)
-
-    # Redirect in Phase 2
-    if r2["domain_changed"] and r2["status"] > 0:
-        # ⚠️ Parking site redirect check
-        if is_parking_redirect(r2["final_url"]):
-            print(f"   ⚠️  Phase 2 redirect → parking site — expired domain!")
-            # Fall through to TLD brute-force + DDG below
-        else:
-            new_url = f"{get_origin(r2['final_url'])}{original_path}"
-            print(f"   🔄  Phase 2 redirect → {new_url}")
-            return {"name": name, "old_url": url, "new_url": new_url,
-                    "emoji": "🔄", "note": f"CF bypass redirect → {get_origin(r2['final_url'])}"}
-
-
-    # Phase 2 → 200 OK check
-    if r2["status"] == 200:
-        if is_parking_or_dead(r2["html"], url):
-            # Phase 2 also dead/parking → TLD brute-force
-            print(f"   ⚠️  Phase 2 also dead/parking → TLD brute-force")
-            new_url = await discover_via_tld_bruteforce(session, executor, name, brand, url)
-            if new_url and new_url != url:
-                print(f"   🔄  TLD brute-force found: {new_url}")
-                return {"name": name, "old_url": url, "new_url": new_url,
-                        "emoji": "🔄", "note": f"Dead domain → TLD → {get_origin(new_url)}"}
-        else:
-            # 200 OK + real content = WORKING, period
-            # Brand check doesn't matter — site is live
-            brand_note = "brand confirmed" if brand_matches_content(r2["html"], brand) else "brand not in HTML"
-            print(f"   ✅  Working (cloudscraper, {brand_note})")
-            return {"name": name, "old_url": url, "new_url": None,
-                    "emoji": "✅", "note": f"Working (CF bypass, {brand_note})"}
-
-    # ── Phase 2.5: TLD Brute-Force (general failure path) ──
-    print(f"   🔀  Phase 2.5: TLD brute-force...")
-    new_url = await discover_via_tld_bruteforce(session, executor, name, brand, url)
+    # ── Phase 2: TLD Brute-Force (general failure path) ──
+    print(f"   🔀  Phase 2: TLD brute-force...")
+    new_url = await discover_via_tld_bruteforce(session, name, brand, url)
     if new_url and new_url != url:
         print(f"   🔄  TLD brute-force found: {new_url}")
         return {"name": name, "old_url": url, "new_url": new_url,
@@ -1031,7 +941,7 @@ async def process_domain(
     # ── Phase 3: DuckDuckGo Discovery ─────────────────────
     print(f"   🔍  Phase 3: Domain discovery...")
     brand = extract_brand(url)
-    new_url = await discover_new_domain(session, executor, name, brand, url)
+    new_url = await discover_new_domain(session, name, brand, url)
 
     if new_url and new_url != url:
         print(f"   🔄  Discovered new domain: {new_url}")
@@ -1075,8 +985,8 @@ def write_github_summary(results: list[DomainResult], updated: int) -> None:
 
 async def main() -> None:
     print("╔═══════════════════════════════════════════════════════════════════╗")
-    print("║  Smart URL Checker v4 — Anti-bot + TLD Brute-Force + Discovery  ║")
-    print("║  Phase1: aiohttp | Phase2: cloudscraper | Phase2.5: TLD | DDG   ║")
+    print("║  Smart URL Checker v4 — Pure Async TLD Brute-Force + Discovery  ║")
+    print("║  Phase1: aiohttp check | Phase2: TLD Brute-force | DDG Search   ║")
     print("╚═══════════════════════════════════════════════════════════════════╝")
 
     try:
@@ -1091,23 +1001,21 @@ async def main() -> None:
     sem = asyncio.Semaphore(CONCURRENCY)
     connector = aiohttp.TCPConnector(ssl=False, limit=50, ttl_dns_cache=300)
 
-    # Thread executor for cloudscraper (sync library)
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        async with aiohttp.ClientSession(connector=connector) as session:
+    async with aiohttp.ClientSession(connector=connector) as session:
 
-            async def bounded(name: str, url: str) -> DomainResult:
-                async with sem:
-                    logs = []
-                    token = _log_ctx.set(logs)
-                    try:
-                        res = await process_domain(session, executor, name, url)
-                        res["logs"] = logs
-                        return res
-                    finally:
-                        _log_ctx.reset(token)
+        async def bounded(name: str, url: str) -> DomainResult:
+            async with sem:
+                logs = []
+                token = _log_ctx.set(logs)
+                try:
+                    res = await process_domain(session, name, url)
+                    res["logs"] = logs
+                    return res
+                finally:
+                    _log_ctx.reset(token)
 
-            tasks = [bounded(name, url) for name, url in entries]
-            results: list[DomainResult] = await asyncio.gather(*tasks)
+        tasks = [bounded(name, url) for name, url in entries]
+        results: list[DomainResult] = await asyncio.gather(*tasks)
 
     # Print logs sequentially
     for r in results:
