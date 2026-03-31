@@ -2,44 +2,51 @@ name: Check Provider URLs
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # Run daily at midnight UTC
-  workflow_dispatch:      # Allow manual triggering
+    - cron: '0 */6 * * *'   # हर 6 घंटे चलेगा
+  push:
+    branches: [main]
+    paths:
+      - 'urls.json'
+      - '.github/scripts/url-checker.py'
+      - '.github/workflows/check-urls.yml'
+  workflow_dispatch:         # Manual trigger
 
-# Set explicit permissions for the GITHUB_TOKEN
 permissions:
   contents: write
 
 jobs:
   check-urls:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 10
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      
-      - name: Install dependencies
-        run: npm install axios
 
-      - name: Run URL checker
-        run: node .github/scripts/url-checker.js
-        
-      # Better approach using git status
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: pip install aiohttp cloudscraper beautifulsoup4
+
+      - name: Run Smart URL Checker
+        run: python .github/scripts/url-checker.py
+
       - name: Commit changes if any
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           git add urls.json
-          
-          # Check if there are changes using git status (more reliable)
+
           if [[ $(git status --porcelain urls.json) ]]; then
-            echo "Found changes in urls.json, committing..."
-            git commit -m "Update provider URLs [skip ci]"
+            echo "✅ urls.json में बदलाव मिले, commit कर रहे हैं..."
+            git commit -m "🔄 Auto-update provider URLs [skip ci]"
             git push
           else
-            echo "No changes detected in urls.json"
+            echo "ℹ️ urls.json में कोई बदलाव नहीं"
           fi
