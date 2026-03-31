@@ -70,7 +70,6 @@ print = _custom_print
 # ══════════════════════════════════════════════════════════
 
 FILE_PATH    = Path("urls.json")
-BACKUP_PATH  = Path("urls.backup.json")
 MAX_REDIRECTS  = 10
 AIOHTTP_TIMEOUT = 12    # seconds — Phase 1 quick check
 CS_TIMEOUT      = 20    # seconds — Phase 2 cloudscraper (slower, solving CF)
@@ -1034,8 +1033,6 @@ async def main() -> None:
     changes = [r for r in results if r["new_url"] and r["new_url"] != r["old_url"]]
 
     if changes:
-        shutil.copy2(FILE_PATH, BACKUP_PATH)
-        print(f"\n💾  Backup: {BACKUP_PATH}")
         for r in changes:
             data[r["name"]] = r["new_url"]
             print(f"📝  [{r['name']}]: {r['old_url']} → {r['new_url']}")
