@@ -822,15 +822,10 @@ async def process_domain(
             return {"name": name, "old_url": url, "new_url": None,
                     "emoji": "✅", "note": f"Working (brand not confirmed but site live)"}
 
-    # 4xx/5xx → server responded, domain alive → keep original
-    if r1["status"] >= 400:
-        print(f"   ✅  Server responded ({r1['status']}) — domain alive, keeping original")
-        return {"name": name, "old_url": url, "new_url": None,
-                "emoji": "✅", "note": f"Server responded ({r1['status']}) — domain alive"}
-
-    # Status 0 = DNS fail / timeout / connection error → truly dead
-    if r1["status"] == 0:
-        print(f"   ❓  Phase 1 failed ({r1['error']}) → TLD brute-force")
+    # If status is 4xx/5xx or 0 -> treat as dead/blocked and find new TLD
+    # GitHub Actions gets 403/503 for Cloudflare challenges, which means it's blocked.
+    if r1["status"] >= 400 or r1["status"] == 0:
+        print(f"   ❓  Phase 1 failed (Status {r1['status']} / {r1['error']}) → TLD brute-force")
 
     # ── Phase 2: TLD Brute-Force (general failure path) ──
     print(f"   🔀  Phase 2: TLD brute-force...")
