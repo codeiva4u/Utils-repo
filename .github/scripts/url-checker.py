@@ -972,8 +972,8 @@ async def process_domain(
             return {"name": name, "old_url": url, "new_url": None,
                     "emoji": "✅", "note": f"Working (JS-rendered, brand not in static HTML)"}
 
-    # 4xx/5xx → server responded, but might be blocking CI IPs
-    # CI में 403 + CF = anti-bot block, site alive
+    # 4xx/5xx → server responded, domain alive → keep original
+    # CI में 403 = site alive but blocking data center IPs
     if r1["status"] >= 400:
         html = r1.get("html", "")
         if is_antibot_page(html, r1["status"]):
@@ -983,28 +983,9 @@ async def process_domain(
                 builtins.print(f"::warning title=Anti-Bot Block::{name}: {url} — {r1['status']} anti-bot (site alive)")
             return {"name": name, "old_url": url, "new_url": None,
                     "emoji": "✅", "note": f"Working (anti-bot {r1['status']}, site alive)"}
-
-        # Non-antibot 4xx — server responded but domain might have moved
-        # CI data center IPs often get plain 403 from sites that work fine locally
-        # → Try TLD brute-force to see if a better domain exists
-        print(f"   ⚠️  Server responded ({r1['status']}) — but trying TLD brute-force for better domain")
-        print(f"   🔀  Phase 2: TLD brute-force...")
-        new_url = await discover_via_tld_bruteforce(session, name, brand, url)
-        if new_url and new_url != url:
-            print(f"   🔄  Better domain found: {new_url}")
-            return {"name": name, "old_url": url, "new_url": new_url,
-                    "emoji": "🔄", "note": f"4xx domain → TLD → {get_origin(new_url)}"}
-        # TLD fail → DDG
-        print(f"   🔍  Phase 3: DDG Discovery...")
-        new_url = await discover_new_domain(session, name, brand, url)
-        if new_url and new_url != url:
-            print(f"   🔄  DDG found better domain: {new_url}")
-            return {"name": name, "old_url": url, "new_url": new_url,
-                    "emoji": "🔄", "note": f"4xx domain → DDG → {get_origin(new_url)}"}
-        # No better domain found → keep original (server did respond)
-        print(f"   ✅  No better domain found — keeping original ({r1['status']})")
+        print(f"   ✅  Server responded ({r1['status']}) — domain alive, keeping original")
         return {"name": name, "old_url": url, "new_url": None,
-                "emoji": "✅", "note": f"Server responded ({r1['status']}) — no better domain"}
+                "emoji": "✅", "note": f"Server responded ({r1['status']}) — domain alive"}
 
     # Status 0 = DNS fail / timeout / connection error → truly dead
     if r1["status"] == 0:
