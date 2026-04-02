@@ -2,7 +2,7 @@ name: Check Provider URLs
 
 on:
   schedule:
-    - cron: '0 */6 * * *'   # हर 6 घंटे चलेगा
+    - cron: '0 */12 * * *'   # हर 6 घंटे चलेगा
   push:
     branches: [main]
     paths:
