@@ -849,7 +849,7 @@ async def discover_new_domain(
             fhtml = fr.get("html", "")
             if (fr["status"] == 200
                     and not is_parking_or_dead(fhtml, final)
-                    and brand_matches_content(fhtml, brand)):
+                    and (brand_matches_content(fhtml, name) or brand_matches_content(fhtml, brand))):
                 print(f"   ✅ Found (DDG + redirect): {final}")
                 return final
             continue
@@ -857,7 +857,7 @@ async def discover_new_domain(
         # Direct 200 + real content + brand confirmed
         if (result["status"] == 200
                 and not is_parking_or_dead(result_html, test_url)
-                and brand_matches_content(result_html, brand)):
+                and (brand_matches_content(result_html, name) or brand_matches_content(result_html, brand))):
             print(f"   ✅ Found (DDG): {test_url}")
             return test_url
 
@@ -881,7 +881,8 @@ async def process_domain(
     print(f"{'─' * 60}")
 
     original_path = get_path(url)
-    brand = extract_brand(url)
+    brand = extract_brand(url)        # URL से brand — TLD brute-force URL construction के लिए
+    verify_brand = name               # JSON key — content verification के लिए (more reliable)
 
     # ── Phase 1: aiohttp quick check ──────────────────────
     r1 = await aiohttp_check(session, url)
@@ -954,22 +955,22 @@ async def process_domain(
             return {"name": name, "old_url": url, "new_url": None,
                     "emoji": "❌", "note": f"Dead domain (parking/empty page)"}
 
-        elif brand_matches_content(html, brand):
+        elif brand_matches_content(html, verify_brand) or brand_matches_content(html, brand):
             # Real content + brand confirmed → ✅ Working
-            print(f"   ✅  Working + brand '{brand}' confirmed")
+            print(f"   ✅  Working + brand '{verify_brand}' confirmed")
             return {"name": name, "old_url": url, "new_url": None,
                     "emoji": "✅", "note": f"Working (brand confirmed)"}
 
         else:
-            # 200 OK + real content + brand NOT found
+            # 200 OK + real content + brand NOT found in page
             # Site is live but brand not in server-rendered HTML (JS app)
             # DON'T replace — just warn
-            print(f"   ⚠️  200 OK, content real, brand '{brand}' not confirmed")
-            print(f"   ✅  Working (content real, brand not confirmed)")
+            print(f"   ⚠️  200 OK, content real, brand '{verify_brand}' not confirmed")
+            print(f"   ✅  Working (content real, brand not confirmed — likely JS-rendered)")
             if os.environ.get("GITHUB_ACTIONS"):
-                builtins.print(f"::warning title=Brand Not Found::{name}: {url} — brand '{brand}' not in page (but site is live)")
+                builtins.print(f"::warning title=JS-Rendered Site::{name}: {url} — brand not in static HTML (JS app, site is live)")
             return {"name": name, "old_url": url, "new_url": None,
-                    "emoji": "✅", "note": f"Working (brand not confirmed but site live)"}
+                    "emoji": "✅", "note": f"Working (JS-rendered, brand not in static HTML)"}
 
     # 4xx/5xx → server responded, domain alive → keep original
     # CI में 403 + CF = anti-bot block, site alive
