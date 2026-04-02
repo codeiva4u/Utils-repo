@@ -2,7 +2,7 @@ name: Check Provider URLs
 
 on:
   schedule:
-    - cron: '0 */12 * * *'   # हर 6 घंटे चलेगा
+    - cron: '0 */12 * * *'  # हर 12 घंटे चलेगा
   push:
     branches: [main]
     paths:
@@ -21,6 +21,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -33,16 +36,17 @@ jobs:
       - name: Run Smart URL Checker
         run: python .github/scripts/url-checker.py
 
-      - name: Commit changes if any
+      - name: Commit and push changes
         run: |
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add urls.json
 
           if [[ $(git status --porcelain urls.json) ]]; then
             echo "✅ urls.json में बदलाव मिले, commit कर रहे हैं..."
             git commit -m "🔄 Auto-update provider URLs [skip ci]"
-            git push
+            git push origin HEAD:main
+            echo "✅ Push successful!"
           else
             echo "ℹ️ urls.json में कोई बदलाव नहीं"
           fi

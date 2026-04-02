@@ -751,20 +751,12 @@ async def discover_via_tld_bruteforce(
         print(f"   🏆  Best TLD: {best['url']} (score {best['score']}, verified)")
         return best["url"]
 
-    if cf_only and IS_CI:
-        # CI में सिर्फ CF-blocked results मिले — DON'T auto-replace
-        # CF block = site probably exists but we can't verify content
-        # गलत domain replace करने से बचो
-        print(f"   ⚠️  TLD brute-force: {len(cf_only)} CF-blocked candidates found")
-        print(f"   ⚠️  CI mode: CF-blocked domains को auto-replace नहीं करेंगे (unverified)")
-        if os.environ.get("GITHUB_ACTIONS"):
-            builtins.print(f"::warning title=CF Blocked TLDs::{name}: {len(cf_only)} TLD candidates CF-blocked, skipping auto-replace")
-        return None
-
-    # Local mode — CF-blocked results: pick best score
+    # CF-blocked results — CI और Local दोनों में best score select करो
     if cf_only:
         best = max(cf_only, key=lambda r: r["score"])
         print(f"   🏆  Best TLD (CF-blocked): {best['url']} (score {best['score']})")
+        if IS_CI and os.environ.get("GITHUB_ACTIONS"):
+            builtins.print(f"::warning title=CF Blocked TLD::{name}: using best CF-blocked candidate {best['url']} (score {best['score']})")
         return best["url"]
 
     print(f"   ❌  TLD brute-force: कोई 100% verified TLD नहीं मिला")
