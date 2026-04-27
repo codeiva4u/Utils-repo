@@ -1,0 +1,45 @@
+name: Smart URL Checker
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'   # हर 12 घंटे में auto-run
+  workflow_dispatch:           # GitHub UI से manually भी trigger कर सकते हैं
+
+permissions:
+  contents: write              # urls.json auto-commit के लिए
+
+jobs:
+  check-urls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Smart URL Checker
+        run: python url_checker.py
+        env:
+          PYTHONUNBUFFERED: '1'
+
+      - name: Auto-commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add urls.json
+          if git diff --staged --quiet; then
+            echo "✅ No changes to commit"
+          else
+            TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+            git commit -m "🔄 URL auto-update: $TIMESTAMP"
+            git push
+            echo "🔄 Changes committed and pushed!"
+          fi
