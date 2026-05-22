@@ -23,9 +23,12 @@ jobs:
           node-version: '24'
       
       - name: Install dependencies
-        run: npm install axios
+        run: npm install
+        
+      - name: Install Patchright Undetected Browser & OS Dependencies
+        run: npx patchright install --with-deps chromium
 
-      - name: Run URL checker
+      - name: Run Stealth URL Checker
         run: node scripts/url-checker.js
         
       # Better approach using git status
